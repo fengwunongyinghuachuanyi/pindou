@@ -10,305 +10,105 @@ import {
   useRef,
   useState,
 } from "react";
-import { BEAD_PALETTE, BRAND_OPTIONS, BeadColor, Brand } from "./palette";
+import {
+  Cell,
+  cloneGrid,
+  colorStats,
+  computeGridSize,
+  EngineSettings,
+  floodFillErase,
+  Grid,
+  nearestColor,
+  processImageData,
+  replaceGridColor,
+  rgbFromHex,
+  sanitizeGrid,
+  serializableGrid,
+} from "./bead-engine";
+import { exportBomCsv, exportGuidePng, exportMatrixCsv, exportProjectJson } from "./exporters";
+import { BEAD_PALETTE, BRAND_OPTIONS, BeadColor, Brand, PALETTE_BY_HEX } from "./palette";
 
-type Cell = { color: BeadColor | null; external: boolean };
-type Grid = Cell[][];
-type Tool = "paint" | "erase" | "picker" | "replace";
-type FitMode = "cover" | "contain";
+type Tool = "paint" | "erase" | "region" | "picker" | "replace";
+type Transform = { rotation: 0 | 90 | 180 | 270; flipX: boolean; flipY: boolean };
 
-type Settings = {
-  size: number;
-  colorLimit: number;
-  merge: number;
-  brightness: number;
-  contrast: number;
-  saturation: number;
-  removeBackground: boolean;
-  backgroundTolerance: number;
-  fit: FitMode;
-};
-
-const INITIAL_SETTINGS: Settings = {
-  size: 29,
+const INITIAL_SETTINGS: EngineSettings = {
+  width: 29,
+  preserveAspect: true,
   colorLimit: 18,
-  merge: 26,
+  mergeStrength: 24,
   brightness: 1,
-  contrast: 1.08,
-  saturation: 1.08,
+  contrast: 1.06,
+  saturation: 1.06,
   removeBackground: true,
-  backgroundTolerance: 54,
+  backgroundTolerance: 48,
   fit: "cover",
+  sampleMode: "dominant",
+  cropX: 50,
+  cropY: 50,
 };
-
+const INITIAL_TRANSFORM: Transform = { rotation: 0, flipX: false, flipY: false };
+const STORAGE_KEY = "doudap-project-v2";
 const DEMO_PATTERN = [
-  "............",
-  "...PP..PP...",
-  "..PPPPPPPP..",
-  ".PPWWPPWWPP.",
-  ".PPBKPPKBPP.",
-  ".PPPPPPPPPP.",
-  "..PPWPPWPP..",
-  "...PPRRPP...",
-  "....PPPP....",
-  "....GPPG....",
-  "...GG..GG...",
-  "............",
+  "............", "...PP..PP...", "..PPPPPPPP..", ".PPWWPPWWPP.", ".PPBKPPKBPP.",
+  ".PPPPPPPPPP.", "..PPWPPWPP..", "...PPRRPP...", "....PPPP....", "....GPPG....",
+  "...GG..GG...", "............",
 ];
 
-function rgbFromHex(hex: string) {
-  return {
-    r: Number.parseInt(hex.slice(1, 3), 16),
-    g: Number.parseInt(hex.slice(3, 5), 16),
-    b: Number.parseInt(hex.slice(5, 7), 16),
-  };
-}
-
-function distance(a: { r: number; g: number; b: number }, b: { r: number; g: number; b: number }) {
-  return Math.sqrt((a.r - b.r) ** 2 + (a.g - b.g) ** 2 + (a.b - b.b) ** 2);
-}
-
-function nearestColor(rgb: { r: number; g: number; b: number }, palette = BEAD_PALETTE) {
-  let best = palette[0];
-  let bestDistance = Number.POSITIVE_INFINITY;
-  for (const color of palette) {
-    const current = distance(rgb, rgbFromHex(color.hex));
-    if (current < bestDistance) {
-      bestDistance = current;
-      best = color;
-    }
-  }
-  return best;
-}
-
-function tunePixel(r: number, g: number, b: number, settings: Settings) {
-  const brightness = settings.brightness;
-  const contrast = settings.contrast;
-  const saturation = settings.saturation;
-  let rr = r * brightness;
-  let gg = g * brightness;
-  let bb = b * brightness;
-  rr = (rr - 128) * contrast + 128;
-  gg = (gg - 128) * contrast + 128;
-  bb = (bb - 128) * contrast + 128;
-  const luminance = rr * 0.299 + gg * 0.587 + bb * 0.114;
-  rr = luminance + (rr - luminance) * saturation;
-  gg = luminance + (gg - luminance) * saturation;
-  bb = luminance + (bb - luminance) * saturation;
-  return {
-    r: Math.max(0, Math.min(255, rr)),
-    g: Math.max(0, Math.min(255, gg)),
-    b: Math.max(0, Math.min(255, bb)),
-  };
-}
-
-function compactPalette(grid: Grid, colorLimit: number): Grid {
-  const counts = new Map<string, number>();
-  for (const row of grid) {
-    for (const cell of row) {
-      if (cell.color) counts.set(cell.color.hex, (counts.get(cell.color.hex) ?? 0) + 1);
-    }
-  }
-  const allowed = [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, colorLimit)
-    .map(([hex]) => BEAD_PALETTE.find((color) => color.hex === hex)!)
-    .filter(Boolean);
-  if (!allowed.length) return grid;
-  return grid.map((row) =>
-    row.map((cell) => {
-      if (!cell.color || allowed.some((color) => color.hex === cell.color!.hex)) return cell;
-      return { ...cell, color: nearestColor(rgbFromHex(cell.color.hex), allowed) };
-    }),
-  );
-}
-
-function mergeIsolatedColors(grid: Grid, strength: number): Grid {
-  if (strength < 8) return grid;
-  const rows = grid.length;
-  const cols = grid[0]?.length ?? 0;
-  const next = grid.map((row) => row.map((cell) => ({ ...cell })));
-  for (let y = 0; y < rows; y += 1) {
-    for (let x = 0; x < cols; x += 1) {
-      const current = grid[y][x].color;
-      if (!current) continue;
-      const neighbors: BeadColor[] = [];
-      for (const [dx, dy] of [
-        [-1, 0],
-        [1, 0],
-        [0, -1],
-        [0, 1],
-      ]) {
-        const neighbor = grid[y + dy]?.[x + dx]?.color;
-        if (neighbor) neighbors.push(neighbor);
-      }
-      const counts = new Map<string, { color: BeadColor; count: number }>();
-      neighbors.forEach((color) => {
-        const found = counts.get(color.hex);
-        counts.set(color.hex, { color, count: (found?.count ?? 0) + 1 });
-      });
-      const winner = [...counts.values()].sort((a, b) => b.count - a.count)[0];
-      if (
-        winner &&
-        winner.count >= 3 &&
-        winner.color.hex !== current.hex &&
-        distance(rgbFromHex(winner.color.hex), rgbFromHex(current.hex)) < strength * 3.4
-      ) {
-        next[y][x].color = winner.color;
-      }
-    }
-  }
-  return next;
-}
-
-function markExternalBackground(grid: Grid, tolerance: number): Grid {
-  const rows = grid.length;
-  const cols = grid[0]?.length ?? 0;
-  if (!rows || !cols) return grid;
-  const edgeCounts = new Map<string, { color: BeadColor; count: number }>();
-  const addEdge = (cell: Cell) => {
-    if (!cell.color) return;
-    const current = edgeCounts.get(cell.color.hex);
-    edgeCounts.set(cell.color.hex, { color: cell.color, count: (current?.count ?? 0) + 1 });
-  };
-  for (let x = 0; x < cols; x += 1) {
-    addEdge(grid[0][x]);
-    addEdge(grid[rows - 1][x]);
-  }
-  for (let y = 1; y < rows - 1; y += 1) {
-    addEdge(grid[y][0]);
-    addEdge(grid[y][cols - 1]);
-  }
-  const dominant = [...edgeCounts.values()].sort((a, b) => b.count - a.count)[0]?.color;
-  if (!dominant) return grid;
-  const dominantRgb = rgbFromHex(dominant.hex);
-  const next = grid.map((row) => row.map((cell) => ({ ...cell, external: false })));
-  const visited = Array.from({ length: rows }, () => Array(cols).fill(false));
-  const queue: Array<[number, number]> = [];
-  const maybeQueue = (x: number, y: number) => {
-    if (visited[y][x]) return;
-    const color = grid[y][x].color;
-    if (color && distance(rgbFromHex(color.hex), dominantRgb) <= tolerance) {
-      visited[y][x] = true;
-      queue.push([x, y]);
-    }
-  };
-  for (let x = 0; x < cols; x += 1) {
-    maybeQueue(x, 0);
-    maybeQueue(x, rows - 1);
-  }
-  for (let y = 0; y < rows; y += 1) {
-    maybeQueue(0, y);
-    maybeQueue(cols - 1, y);
-  }
-  while (queue.length) {
-    const [x, y] = queue.shift()!;
-    next[y][x].external = true;
-    for (const [dx, dy] of [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-    ]) {
-      const nx = x + dx;
-      const ny = y + dy;
-      if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) maybeQueue(nx, ny);
-    }
-  }
-  return next;
-}
-
-function processImage(image: HTMLImageElement, settings: Settings): Grid {
-  const size = settings.size;
-  const sampling = 3;
-  const canvas = document.createElement("canvas");
-  canvas.width = size * sampling;
-  canvas.height = size * sampling;
-  const context = canvas.getContext("2d", { willReadFrequently: true })!;
-  context.fillStyle = "#ffffff";
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  context.imageSmoothingEnabled = true;
-  context.imageSmoothingQuality = "high";
-  const imageRatio = image.width / image.height;
-  let drawWidth = canvas.width;
-  let drawHeight = canvas.height;
-  if ((settings.fit === "cover" && imageRatio > 1) || (settings.fit === "contain" && imageRatio < 1)) {
-    drawWidth = canvas.height * imageRatio;
-  } else {
-    drawHeight = canvas.width / imageRatio;
-  }
-  context.drawImage(image, (canvas.width - drawWidth) / 2, (canvas.height - drawHeight) / 2, drawWidth, drawHeight);
-  const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-  let grid: Grid = Array.from({ length: size }, (_, y) =>
-    Array.from({ length: size }, (_, x) => {
-      const buckets = new Map<string, { r: number; g: number; b: number; count: number }>();
-      for (let sy = 0; sy < sampling; sy += 1) {
-        for (let sx = 0; sx < sampling; sx += 1) {
-          const index = ((y * sampling + sy) * canvas.width + (x * sampling + sx)) * 4;
-          if (pixels[index + 3] < 40) continue;
-          const tuned = tunePixel(pixels[index], pixels[index + 1], pixels[index + 2], settings);
-          const key = `${Math.round(tuned.r / 24)}-${Math.round(tuned.g / 24)}-${Math.round(tuned.b / 24)}`;
-          const bucket = buckets.get(key);
-          buckets.set(key, {
-            r: (bucket?.r ?? 0) + tuned.r,
-            g: (bucket?.g ?? 0) + tuned.g,
-            b: (bucket?.b ?? 0) + tuned.b,
-            count: (bucket?.count ?? 0) + 1,
-          });
-        }
-      }
-      const dominant = [...buckets.values()].sort((a, b) => b.count - a.count)[0] ?? {
-        r: 255,
-        g: 255,
-        b: 255,
-        count: 1,
-      };
-      return {
-        color: nearestColor({
-          r: dominant.r / dominant.count,
-          g: dominant.g / dominant.count,
-          b: dominant.b / dominant.count,
-        }),
-        external: false,
-      };
-    }),
-  );
-  grid = compactPalette(grid, settings.colorLimit);
-  grid = mergeIsolatedColors(grid, settings.merge);
-  if (settings.removeBackground) grid = markExternalBackground(grid, settings.backgroundTolerance);
-  return grid;
-}
-
-function cloneGrid(grid: Grid): Grid {
-  return grid.map((row) => row.map((cell) => ({ ...cell })));
-}
-
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  window.setTimeout(() => URL.revokeObjectURL(url), 500);
+function cellKey(x: number, y: number) {
+  return x + "-" + y;
 }
 
 function formatTime(minutes: number) {
-  if (minutes < 60) return `约 ${Math.max(1, Math.round(minutes))} 分钟`;
+  if (minutes < 60) return "约 " + Math.max(1, Math.round(minutes)) + " 分钟";
   const hours = Math.floor(minutes / 60);
   const rest = Math.round(minutes % 60);
-  return `约 ${hours} 小时${rest ? ` ${rest} 分` : ""}`;
+  return "约 " + hours + " 小时" + (rest ? " " + rest + " 分" : "");
+}
+
+function formatClock(seconds: number) {
+  const values = [Math.floor(seconds / 3600), Math.floor((seconds % 3600) / 60), seconds % 60];
+  return values.map((value) => String(value).padStart(2, "0")).join(":");
+}
+
+function isDark(hex: string) {
+  const rgb = rgbFromHex(hex);
+  return rgb.r * 0.299 + rgb.g * 0.587 + rgb.b * 0.114 < 145;
+}
+
+function safeSettings(value: unknown): Partial<EngineSettings> {
+  if (!value || typeof value !== "object") return {};
+  const raw = value as Record<string, unknown>;
+  const result: Partial<EngineSettings> = {};
+  if (typeof raw.width === "number") result.width = Math.max(8, Math.min(100, raw.width));
+  if (typeof raw.preserveAspect === "boolean") result.preserveAspect = raw.preserveAspect;
+  if (typeof raw.colorLimit === "number") result.colorLimit = Math.max(2, Math.min(60, raw.colorLimit));
+  if (typeof raw.mergeStrength === "number") result.mergeStrength = Math.max(0, Math.min(60, raw.mergeStrength));
+  if (typeof raw.brightness === "number") result.brightness = Math.max(0.7, Math.min(1.35, raw.brightness));
+  if (typeof raw.contrast === "number") result.contrast = Math.max(0.7, Math.min(1.45, raw.contrast));
+  if (typeof raw.saturation === "number") result.saturation = Math.max(0.5, Math.min(1.6, raw.saturation));
+  if (typeof raw.removeBackground === "boolean") result.removeBackground = raw.removeBackground;
+  if (typeof raw.backgroundTolerance === "number") result.backgroundTolerance = Math.max(8, Math.min(90, raw.backgroundTolerance));
+  if (raw.fit === "contain" || raw.fit === "cover") result.fit = raw.fit;
+  if (raw.sampleMode === "average" || raw.sampleMode === "dominant") result.sampleMode = raw.sampleMode;
+  if (typeof raw.cropX === "number") result.cropX = Math.max(0, Math.min(100, raw.cropX));
+  if (typeof raw.cropY === "number") result.cropY = Math.max(0, Math.min(100, raw.cropY));
+  return result;
 }
 
 export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const projectInputRef = useRef<HTMLInputElement>(null);
+  const matrixInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sourceImageRef = useRef<HTMLImageElement | null>(null);
   const objectUrlRef = useRef<string | null>(null);
   const isDrawingRef = useRef(false);
+  const restoredRef = useRef(false);
   const [sourceVersion, setSourceVersion] = useState(0);
   const [fileName, setFileName] = useState("");
   const [sourcePreview, setSourcePreview] = useState("");
-  const [settings, setSettings] = useState<Settings>(INITIAL_SETTINGS);
+  const [settings, setSettings] = useState<EngineSettings>(INITIAL_SETTINGS);
+  const [transform, setTransform] = useState<Transform>(INITIAL_TRANSFORM);
   const [brand, setBrand] = useState<Brand>("MARD");
   const [grid, setGrid] = useState<Grid>([]);
   const [processing, setProcessing] = useState(false);
@@ -321,102 +121,191 @@ export default function Home() {
   const [undoStack, setUndoStack] = useState<Grid[]>([]);
   const [redoStack, setRedoStack] = useState<Grid[]>([]);
   const [prompt, setPrompt] = useState("");
-  const [promptNotes, setPromptNotes] = useState<string[]>([]);
+  const [assistantNote, setAssistantNote] = useState("");
   const [focusMode, setFocusMode] = useState(false);
+  const [focusColor, setFocusColor] = useState("");
   const [completedCells, setCompletedCells] = useState<Set<string>>(new Set());
+  const [focusSeconds, setFocusSeconds] = useState(0);
+  const [timerRunning, setTimerRunning] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [inventoryOpen, setInventoryOpen] = useState(false);
+  const [inventorySearch, setInventorySearch] = useState("");
+  const [activeHexes, setActiveHexes] = useState<Set<string>>(() => new Set(BEAD_PALETTE.map((color) => color.hex)));
+  const [inventoryDraft, setInventoryDraft] = useState<Set<string>>(() => new Set(BEAD_PALETTE.map((color) => color.hex)));
+  const [restoreNote, setRestoreNote] = useState("");
 
-  const hasImage = sourceVersion > 0;
+  const hasSource = sourceVersion > 0;
+  const hasWorkspace = hasSource || grid.length > 0;
+  const activePalette = useMemo(() => BEAD_PALETTE.filter((color) => activeHexes.has(color.hex)), [activeHexes]);
+  const stats = useMemo(() => colorStats(grid), [grid]);
+  const totalBeads = useMemo(() => stats.reduce((sum, item) => sum + item.count, 0), [stats]);
+  const focusedTotal = useMemo(() => grid.reduce((sum, row) => sum + row.filter((cell) => !cell.external && cell.color && (!focusColor || cell.color.hex === focusColor)).length, 0), [grid, focusColor]);
+  const focusedDone = useMemo(() => {
+    let count = 0;
+    completedCells.forEach((key) => {
+      const parts = key.split("-").map(Number);
+      const cell = grid[parts[1]]?.[parts[0]];
+      if (cell && !cell.external && cell.color && (!focusColor || cell.color.hex === focusColor)) count += 1;
+    });
+    return count;
+  }, [completedCells, focusColor, grid]);
+  const focusProgress = focusedTotal ? Math.round(focusedDone / focusedTotal * 100) : 0;
 
-  const colorStats = useMemo(() => {
-    const result = new Map<string, { color: BeadColor; count: number }>();
-    grid.forEach((row) =>
-      row.forEach((cell) => {
-        if (!cell.external && cell.color) {
-          const current = result.get(cell.color.hex);
-          result.set(cell.color.hex, { color: cell.color, count: (current?.count ?? 0) + 1 });
-        }
-      }),
-    );
-    return [...result.values()].sort((a, b) => b.count - a.count);
-  }, [grid]);
-
-  const totalBeads = useMemo(() => colorStats.reduce((sum, item) => sum + item.count, 0), [colorStats]);
-  const occupiedRatio = grid.length ? totalBeads / (grid.length * grid[0].length) : 0.72;
-  const makeMinutes = totalBeads * 0.11;
-  const completedCount = completedCells.size;
-  const focusProgress = totalBeads ? Math.min(100, Math.round((completedCount / totalBeads) * 100)) : 0;
+  const renderSource = useCallback(() => {
+    const image = sourceImageRef.current;
+    if (!image) return;
+    const naturalWidth = image.naturalWidth || image.width;
+    const naturalHeight = image.naturalHeight || image.height;
+    const scale = Math.min(1, 1400 / Math.max(naturalWidth, naturalHeight));
+    const imageWidth = Math.max(1, Math.round(naturalWidth * scale));
+    const imageHeight = Math.max(1, Math.round(naturalHeight * scale));
+    const swapped = transform.rotation === 90 || transform.rotation === 270;
+    const canvas = document.createElement("canvas");
+    canvas.width = swapped ? imageHeight : imageWidth;
+    canvas.height = swapped ? imageWidth : imageHeight;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) return;
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.translate(canvas.width / 2, canvas.height / 2);
+    context.rotate(transform.rotation * Math.PI / 180);
+    context.scale(transform.flipX ? -1 : 1, transform.flipY ? -1 : 1);
+    context.drawImage(image, -imageWidth / 2, -imageHeight / 2, imageWidth, imageHeight);
+    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+    const size = computeGridSize(canvas.width, canvas.height, settings.width, settings.preserveAspect);
+    setGrid(processImageData(imageData, size.width, size.height, settings, activePalette));
+    setUndoStack([]);
+    setRedoStack([]);
+    setCompletedCells(new Set());
+    setProcessing(false);
+  }, [activePalette, settings, transform]);
 
   useEffect(() => {
-    if (!sourceImageRef.current || !hasImage) return;
-    setProcessing(true);
+    if (!hasSource) return;
     const timer = window.setTimeout(() => {
-      const next = processImage(sourceImageRef.current!, settings);
-      setGrid(next);
-      setUndoStack([]);
-      setRedoStack([]);
-      setCompletedCells(new Set());
-      setProcessing(false);
-    }, 100);
+      setProcessing(true);
+      window.requestAnimationFrame(renderSource);
+    }, 90);
     return () => window.clearTimeout(timer);
-  }, [sourceVersion, settings, hasImage]);
+  }, [hasSource, renderSource, sourceVersion]);
+
+  useEffect(() => {
+    if (restoredRef.current) return;
+    restoredRef.current = true;
+    const timer = window.setTimeout(() => {
+      try {
+        const saved = window.localStorage.getItem(STORAGE_KEY);
+        if (!saved) return;
+        const project = JSON.parse(saved) as Record<string, unknown>;
+        const savedGrid = sanitizeGrid(project.grid);
+        if (!savedGrid) return;
+        setGrid(savedGrid);
+        setSettings((current) => ({ ...current, ...safeSettings(project.settings) }));
+        if (BRAND_OPTIONS.includes(project.brand as Brand)) setBrand(project.brand as Brand);
+        if (Array.isArray(project.activePalette)) {
+          const valid = new Set((project.activePalette as unknown[]).filter((hex): hex is string => typeof hex === "string" && PALETTE_BY_HEX.has(hex)));
+          if (valid.size) setActiveHexes(valid);
+        }
+        if (Array.isArray(project.completed)) setCompletedCells(new Set((project.completed as unknown[]).filter((key): key is string => typeof key === "string")));
+        if (typeof project.focusSeconds === "number") setFocusSeconds(Math.max(0, Math.round(project.focusSeconds)));
+        if (project.transform && typeof project.transform === "object") setTransform({ ...INITIAL_TRANSFORM, ...(project.transform as Transform) });
+        setFileName(typeof project.name === "string" ? project.name : "已恢复的工程");
+        setRestoreNote("已从本机自动恢复上次工程；原图从未被保存或上传。");
+      } catch {
+        window.localStorage.removeItem(STORAGE_KEY);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!grid.length) return;
+    const timer = window.setTimeout(() => {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        version: 2,
+        name: fileName || "豆搭工程",
+        savedAt: new Date().toISOString(),
+        settings,
+        transform,
+        brand,
+        activePalette: [...activeHexes],
+        completed: [...completedCells],
+        focusSeconds,
+        grid: serializableGrid(grid),
+      }));
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [grid, settings, transform, brand, activeHexes, completedCells, focusSeconds, fileName]);
+
+  useEffect(() => {
+    if (!timerRunning) return;
+    const timer = window.setInterval(() => setFocusSeconds((value) => value + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [timerRunning]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !grid.length) return;
     const rows = grid.length;
     const cols = grid[0].length;
-    const baseCell = settings.size <= 32 ? 20 : 13;
-    const cellSize = Math.max(7, Math.round(baseCell * (zoom / 100)));
+    const baseCell = cols <= 32 ? 20 : cols <= 60 ? 13 : 9;
+    const cellSize = Math.max(6, Math.round(baseCell * zoom / 100));
     const ratio = window.devicePixelRatio || 1;
     canvas.width = cols * cellSize * ratio;
     canvas.height = rows * cellSize * ratio;
-    canvas.style.width = `${cols * cellSize}px`;
-    canvas.style.height = `${rows * cellSize}px`;
-    const context = canvas.getContext("2d")!;
+    canvas.style.width = cols * cellSize + "px";
+    canvas.style.height = rows * cellSize + "px";
+    const context = canvas.getContext("2d");
+    if (!context) return;
     context.scale(ratio, ratio);
     context.fillStyle = "#f7f7f3";
     context.fillRect(0, 0, cols * cellSize, rows * cellSize);
-    grid.forEach((row, y) =>
-      row.forEach((cell, x) => {
-        const px = x * cellSize;
-        const py = y * cellSize;
-        if (cell.external || !cell.color) {
-          context.fillStyle = (x + y) % 2 ? "#f5f5f0" : "#ebebe5";
+    for (let y = 0; y < rows; y += 1) for (let x = 0; x < cols; x += 1) {
+      const cell = grid[y][x];
+      const px = x * cellSize;
+      const py = y * cellSize;
+      if (cell.external || !cell.color) {
+        context.fillStyle = (x + y) % 2 ? "#f5f5f0" : "#e9eae4";
+        context.fillRect(px, py, cellSize, cellSize);
+      } else {
+        context.fillStyle = cell.color.hex;
+        context.fillRect(px, py, cellSize, cellSize);
+        context.fillStyle = "rgba(255,255,255,.3)";
+        context.beginPath();
+        context.arc(px + cellSize * 0.32, py + cellSize * 0.29, Math.max(1, cellSize * 0.08), 0, Math.PI * 2);
+        context.fill();
+        if (focusMode && focusColor && cell.color.hex !== focusColor) {
+          context.fillStyle = "rgba(245,246,242,.8)";
           context.fillRect(px, py, cellSize, cellSize);
-        } else {
-          context.fillStyle = cell.color.hex;
-          context.fillRect(px, py, cellSize, cellSize);
-          context.fillStyle = "rgba(255,255,255,.28)";
-          context.beginPath();
-          context.arc(px + cellSize * 0.33, py + cellSize * 0.3, Math.max(1, cellSize * 0.09), 0, Math.PI * 2);
-          context.fill();
-          if (showCodes && cellSize >= 17) {
-            const rgb = rgbFromHex(cell.color.hex);
-            const dark = rgb.r * 0.299 + rgb.g * 0.587 + rgb.b * 0.114 < 145;
-            context.fillStyle = dark ? "rgba(255,255,255,.92)" : "rgba(20,20,20,.78)";
-            context.font = `600 ${Math.max(7, cellSize * 0.32)}px ui-monospace, monospace`;
-            context.textAlign = "center";
-            context.textBaseline = "middle";
-            context.fillText(cell.color.codes[brand], px + cellSize / 2, py + cellSize / 2 + 1);
-          }
-          if (completedCells.has(`${x}-${y}`)) {
-            context.fillStyle = "rgba(255,255,255,.68)";
-            context.fillRect(px, py, cellSize, cellSize);
-            context.fillStyle = "#16634a";
-            context.beginPath();
-            context.arc(px + cellSize / 2, py + cellSize / 2, Math.max(2, cellSize * 0.15), 0, Math.PI * 2);
-            context.fill();
-          }
         }
-        context.strokeStyle = cellSize >= 17 ? "rgba(31,35,32,.17)" : "rgba(31,35,32,.1)";
-        context.lineWidth = 0.55;
-        context.strokeRect(px, py, cellSize, cellSize);
-      }),
-    );
-  }, [grid, settings.size, zoom, showCodes, brand, completedCells]);
+        if (showCodes && cellSize >= 16 && (!focusMode || !focusColor || cell.color.hex === focusColor)) {
+          context.fillStyle = isDark(cell.color.hex) ? "rgba(255,255,255,.93)" : "rgba(20,20,20,.78)";
+          context.font = "700 " + Math.max(7, cellSize * 0.3) + "px ui-monospace, monospace";
+          context.textAlign = "center";
+          context.textBaseline = "middle";
+          context.fillText(cell.color.codes[brand], px + cellSize / 2, py + cellSize / 2 + 1);
+        }
+        if (completedCells.has(cellKey(x, y))) {
+          context.fillStyle = "rgba(255,255,255,.7)";
+          context.fillRect(px, py, cellSize, cellSize);
+          context.fillStyle = "#16634a";
+          context.beginPath();
+          context.arc(px + cellSize / 2, py + cellSize / 2, Math.max(2, cellSize * 0.15), 0, Math.PI * 2);
+          context.fill();
+        }
+      }
+      const boardLine = x > 0 && x % 29 === 0 || y > 0 && y % 29 === 0;
+      const guideLine = x > 0 && x % 5 === 0 || y > 0 && y % 5 === 0;
+      context.strokeStyle = boardLine ? "rgba(24,61,49,.58)" : guideLine ? "rgba(31,35,32,.3)" : "rgba(31,35,32,.12)";
+      context.lineWidth = boardLine ? 1.5 : guideLine ? 0.85 : 0.5;
+      context.strokeRect(px, py, cellSize, cellSize);
+    }
+  }, [grid, zoom, showCodes, brand, completedCells, focusMode, focusColor]);
 
-  const loadImage = useCallback((url: string, name: string, revoke = false) => {
+  useEffect(() => () => {
+    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+  }, []);
+
+  const loadImage = useCallback((url: string, name: string, revoke: boolean) => {
     const image = new Image();
     image.onload = () => {
       if (objectUrlRef.current && objectUrlRef.current !== url) URL.revokeObjectURL(objectUrlRef.current);
@@ -424,129 +313,117 @@ export default function Home() {
       sourceImageRef.current = image;
       setFileName(name);
       setSourcePreview(url);
+      setRestoreNote("");
       setSourceVersion((version) => version + 1);
     };
+    image.onerror = () => window.alert("图片读取失败，请换一张 PNG、JPG 或 WebP。");
     image.src = url;
   }, []);
 
-  const acceptFile = useCallback(
-    (file?: File) => {
-      if (!file) return;
-      if (!file.type.startsWith("image/")) return;
-      if (file.size > 15 * 1024 * 1024) {
-        window.alert("图片请控制在 15MB 以内。");
-        return;
-      }
-      loadImage(URL.createObjectURL(file), file.name, true);
-    },
-    [loadImage],
-  );
+  const acceptFile = useCallback((file?: File) => {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      window.alert("请选择 PNG、JPG 或 WebP 图片。");
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      window.alert("图片请控制在 20MB 以内。");
+      return;
+    }
+    loadImage(URL.createObjectURL(file), file.name, true);
+  }, [loadImage]);
 
   const loadDemo = useCallback(() => {
     const canvas = document.createElement("canvas");
-    canvas.width = 720;
-    canvas.height = 720;
-    const context = canvas.getContext("2d")!;
-    const gradient = context.createLinearGradient(0, 0, 720, 720);
+    canvas.width = 900;
+    canvas.height = 680;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    const gradient = context.createLinearGradient(0, 0, 900, 680);
     gradient.addColorStop(0, "#cdeeff");
     gradient.addColorStop(1, "#fff0d9");
     context.fillStyle = gradient;
-    context.fillRect(0, 0, 720, 720);
+    context.fillRect(0, 0, 900, 680);
     context.fillStyle = "#ff9f83";
     context.beginPath();
-    context.arc(360, 350, 220, 0, Math.PI * 2);
+    context.arc(450, 340, 245, 0, Math.PI * 2);
     context.fill();
     context.fillStyle = "#8a4c38";
     context.beginPath();
-    context.moveTo(205, 220);
-    context.lineTo(250, 90);
-    context.lineTo(320, 205);
-    context.moveTo(400, 205);
-    context.lineTo(470, 90);
-    context.lineTo(520, 225);
+    context.moveTo(270, 225);
+    context.lineTo(315, 65);
+    context.lineTo(390, 205);
+    context.moveTo(510, 205);
+    context.lineTo(585, 65);
+    context.lineTo(630, 225);
     context.fill();
     context.fillStyle = "#fff7e9";
     context.beginPath();
-    context.ellipse(360, 365, 150, 175, 0, 0, Math.PI * 2);
+    context.ellipse(450, 360, 165, 190, 0, 0, Math.PI * 2);
     context.fill();
     context.fillStyle = "#22252b";
     context.beginPath();
-    context.arc(305, 330, 18, 0, Math.PI * 2);
-    context.arc(415, 330, 18, 0, Math.PI * 2);
+    context.arc(390, 320, 19, 0, Math.PI * 2);
+    context.arc(510, 320, 19, 0, Math.PI * 2);
     context.fill();
     context.fillStyle = "#e8649e";
     context.beginPath();
-    context.moveTo(345, 385);
-    context.lineTo(375, 385);
-    context.lineTo(360, 404);
+    context.moveTo(433, 382);
+    context.lineTo(467, 382);
+    context.lineTo(450, 404);
     context.closePath();
     context.fill();
-    context.strokeStyle = "#8a4c38";
-    context.lineWidth = 9;
-    context.lineCap = "round";
-    context.beginPath();
-    context.moveTo(360, 404);
-    context.quadraticCurveTo(330, 438, 305, 416);
-    context.moveTo(360, 404);
-    context.quadraticCurveTo(390, 438, 415, 416);
-    context.stroke();
-    loadImage(canvas.toDataURL("image/png"), "演示-小猫.png");
+    loadImage(canvas.toDataURL("image/png"), "演示-小猫.png", false);
   }, [loadImage]);
 
   const pushHistory = useCallback(() => {
-    setUndoStack((stack) => [...stack.slice(-18), cloneGrid(grid)]);
+    setUndoStack((stack) => [...stack.slice(-24), cloneGrid(grid)]);
     setRedoStack([]);
   }, [grid]);
 
-  const editCell = useCallback(
-    (x: number, y: number, startAction: boolean) => {
-      const cell = grid[y]?.[x];
-      if (!cell) return;
-      if (focusMode) {
-        if (cell.external || !cell.color) return;
-        setCompletedCells((current) => {
-          const next = new Set(current);
-          const key = `${x}-${y}`;
-          if (next.has(key)) next.delete(key);
-          else next.add(key);
-          return next;
-        });
-        return;
-      }
-      if (tool === "picker") {
-        if (cell.color) setSelectedColor(cell.color);
-        setTool("paint");
-        return;
-      }
-      if (startAction) pushHistory();
-      setGrid((current) => {
-        const next = cloneGrid(current);
-        const target = next[y][x];
-        if (tool === "erase") {
-          next[y][x] = { ...target, external: true };
-        } else if (tool === "replace") {
-          const from = target.color?.hex;
-          if (!from) return current;
-          return next.map((row) =>
-            row.map((item) =>
-              !item.external && item.color?.hex === from ? { color: selectedColor, external: false } : item,
-            ),
-          );
-        } else {
-          next[y][x] = { color: selectedColor, external: false };
-        }
+  const editCell = useCallback((x: number, y: number, startAction: boolean) => {
+    const cell = grid[y]?.[x];
+    if (!cell) return;
+    if (focusMode) {
+      if (cell.external || !cell.color || focusColor && cell.color.hex !== focusColor) return;
+      setCompletedCells((current) => {
+        const next = new Set(current);
+        const key = cellKey(x, y);
+        if (next.has(key)) next.delete(key); else next.add(key);
         return next;
       });
-    },
-    [grid, focusMode, tool, selectedColor, pushHistory],
-  );
+      return;
+    }
+    if (tool === "picker") {
+      if (cell.color) setSelectedColor(cell.color);
+      setTool("paint");
+      return;
+    }
+    if (startAction) pushHistory();
+    setCompletedCells((current) => {
+      const next = new Set(current);
+      next.delete(cellKey(x, y));
+      return next;
+    });
+    if (tool === "region") {
+      setGrid((current) => floodFillErase(current, x, y));
+    } else if (tool === "replace") {
+      if (cell.color && !cell.external) setGrid((current) => replaceGridColor(current, cell.color!.hex, selectedColor));
+    } else {
+      setGrid((current) => {
+        const next = cloneGrid(current);
+        next[y][x] = tool === "erase" ? { color: null, external: true } : { color: selectedColor, external: false };
+        return next;
+      });
+    }
+  }, [grid, focusMode, focusColor, tool, selectedColor, pushHistory]);
 
   const cellFromEvent = useCallback((event: ReactPointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas || !grid.length) return null;
     const bounds = canvas.getBoundingClientRect();
-    const x = Math.floor(((event.clientX - bounds.left) / bounds.width) * grid[0].length);
-    const y = Math.floor(((event.clientY - bounds.top) / bounds.height) * grid.length);
+    const x = Math.floor((event.clientX - bounds.left) / bounds.width * grid[0].length);
+    const y = Math.floor((event.clientY - bounds.top) / bounds.height * grid.length);
     if (x < 0 || y < 0 || x >= grid[0].length || y >= grid.length) return null;
     return { x, y, cell: grid[y][x] };
   }, [grid]);
@@ -569,402 +446,383 @@ export default function Home() {
 
   const applyPrompt = () => {
     const value = prompt.trim();
-    if (!value || !hasImage) return;
+    if (!value) return;
     const notes: string[] = [];
-    setSettings((current) => {
-      const next = { ...current };
-      if (/29|小尺寸|省时|快一点/.test(value)) {
-        next.size = 29;
-        notes.push("切换为 29×29 快速方案");
-      }
-      if (/58|更清晰|更精细|细节/.test(value)) {
-        next.size = 58;
-        notes.push("切换为 58×58 精细方案");
-      }
-      if (/颜色少|少一点颜色|简洁|大色块|好买豆/.test(value)) {
-        next.colorLimit = Math.min(next.colorLimit, 12);
-        next.merge = Math.max(next.merge, 46);
-        notes.push("减少过渡色并合并杂色");
-      }
-      if (/去.*背景|白底|只保留|主体|抠图/.test(value)) {
-        next.removeBackground = true;
-        next.backgroundTolerance = Math.max(next.backgroundTolerance, 72);
-        notes.push("清理与边缘相连的背景");
-      }
-      if (/鲜艳|明亮|提亮|通透/.test(value)) {
-        next.saturation = 1.32;
-        next.brightness = 1.08;
-        notes.push("提高亮度与饱和度");
-      }
-      if (/轮廓|清晰|对比|眼睛|五官/.test(value)) {
-        next.contrast = 1.28;
-        next.merge = Math.max(next.merge, 34);
-        notes.push("增强主体对比和轮廓");
-      }
-      if (/柔和|低饱和|莫兰迪/.test(value)) {
-        next.saturation = 0.82;
-        next.contrast = 0.96;
-        notes.push("降低饱和度并软化对比");
-      }
-      if (!notes.length) {
-        next.merge = Math.max(next.merge, 38);
-        next.contrast = Math.max(next.contrast, 1.16);
-        notes.push("已按“更干净、更可拼”的方向整理画面");
-      }
-      return next;
-    });
-    setPromptNotes(notes);
+    const patch: Partial<EngineSettings> = {};
+    const colorMatch = value.match(/(?:颜色|色彩|色号|改成|限制)\D{0,4}(\d{1,2})\s*色?/);
+    if (colorMatch) {
+      patch.colorLimit = Math.max(2, Math.min(60, Number(colorMatch[1])));
+      notes.push("颜色上限设为 " + patch.colorLimit + " 色");
+    }
+    if (/去除?背景|透明背景|抠图/.test(value)) { patch.removeBackground = true; notes.push("启用边缘连通去背景"); }
+    if (/保留背景|不要去背景|关闭背景/.test(value)) { patch.removeBackground = false; notes.push("保留背景"); }
+    if (/鲜艳|饱和/.test(value) && !/降低|减少|不要/.test(value)) { patch.saturation = 1.28; notes.push("提高饱和度"); }
+    if (/降低饱和|柔和|淡一点/.test(value)) { patch.saturation = 0.82; notes.push("降低饱和度"); }
+    if (/更亮|亮一点/.test(value)) { patch.brightness = 1.15; notes.push("提高亮度"); }
+    if (/更暗|暗一点/.test(value)) { patch.brightness = 0.88; notes.push("降低亮度"); }
+    if (/减少杂色|合并碎色|更干净|平滑/.test(value)) { patch.mergeStrength = 44; notes.push("加强孤立色合并"); }
+    if (/保留细节|更清晰|不要合并/.test(value)) { patch.mergeStrength = 5; notes.push("优先保留细节"); }
+    if (/主体完整|不要裁切|完整显示/.test(value)) { patch.fit = "contain"; notes.push("完整显示主体"); }
+    if (!notes.length) {
+      setAssistantNote("没有改动：暂未识别。可尝试“限制 12 色、去背景、更鲜艳、减少杂色、主体完整”。");
+      return;
+    }
+    setSettings((current) => ({ ...current, ...patch }));
+    setAssistantNote(notes.join("；"));
     setPrompt("");
   };
 
-  const renderExportCanvas = () => {
-    const cellSize = settings.size <= 32 ? 36 : 25;
-    const margin = 48;
-    const header = 96;
-    const legendColumns = 3;
-    const legendRows = Math.ceil(colorStats.length / legendColumns);
-    const legendHeight = 72 + legendRows * 34;
-    const canvas = document.createElement("canvas");
-    canvas.width = grid[0].length * cellSize + margin * 2;
-    canvas.height = header + grid.length * cellSize + legendHeight;
-    const context = canvas.getContext("2d")!;
-    context.fillStyle = "#fffdf8";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.fillStyle = "#17221d";
-    context.font = "700 28px system-ui, sans-serif";
-    context.fillText("豆搭 · 拼豆制作图纸", margin, 42);
-    context.fillStyle = "#66706b";
-    context.font = "14px system-ui, sans-serif";
-    context.fillText(
-      `${settings.size}×${settings.size} 格 · ${brand} 色号 · ${totalBeads} 颗 · 成品约 ${(settings.size * 0.5).toFixed(1)}cm`,
-      margin,
-      68,
-    );
-    grid.forEach((row, y) =>
-      row.forEach((cell, x) => {
-        const px = margin + x * cellSize;
-        const py = header + y * cellSize;
-        if (cell.external || !cell.color) {
-          context.fillStyle = "#ffffff";
-        } else {
-          context.fillStyle = cell.color.hex;
-        }
-        context.fillRect(px, py, cellSize, cellSize);
-        context.strokeStyle = "rgba(28,34,31,.24)";
-        context.strokeRect(px, py, cellSize, cellSize);
-        if (!cell.external && cell.color) {
-          const rgb = rgbFromHex(cell.color.hex);
-          const dark = rgb.r * 0.299 + rgb.g * 0.587 + rgb.b * 0.114 < 145;
-          context.fillStyle = dark ? "white" : "#202622";
-          context.font = `600 ${settings.size <= 32 ? 10 : 7}px ui-monospace, monospace`;
-          context.textAlign = "center";
-          context.textBaseline = "middle";
-          context.fillText(cell.color.codes[brand], px + cellSize / 2, py + cellSize / 2);
-        }
-      }),
-    );
-    const legendY = header + grid.length * cellSize + 44;
-    context.textAlign = "left";
-    context.fillStyle = "#17221d";
-    context.font = "700 18px system-ui, sans-serif";
-    context.fillText("用豆清单", margin, legendY - 16);
-    const columnWidth = (canvas.width - margin * 2) / legendColumns;
-    colorStats.forEach((item, index) => {
-      const column = index % legendColumns;
-      const row = Math.floor(index / legendColumns);
-      const x = margin + column * columnWidth;
-      const y = legendY + row * 34;
-      context.fillStyle = item.color.hex;
-      context.fillRect(x, y, 22, 22);
-      context.strokeStyle = "rgba(0,0,0,.18)";
-      context.strokeRect(x, y, 22, 22);
-      context.fillStyle = "#26302b";
-      context.font = "13px system-ui, sans-serif";
-      context.fillText(`${item.color.codes[brand]}  ${item.color.name}  ×${item.count}`, x + 31, y + 15);
+  const importProject = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const project = JSON.parse(await file.text()) as Record<string, unknown>;
+      const importedGrid = sanitizeGrid(project.grid);
+      if (!importedGrid) throw new Error("invalid");
+      sourceImageRef.current = null;
+      setSourceVersion(0);
+      setSourcePreview("");
+      setGrid(importedGrid);
+      setSettings((current) => ({ ...current, ...safeSettings(project.settings) }));
+      if (BRAND_OPTIONS.includes(project.brand as Brand)) setBrand(project.brand as Brand);
+      if (Array.isArray(project.activePalette)) {
+        const valid = new Set((project.activePalette as unknown[]).filter((hex): hex is string => typeof hex === "string" && PALETTE_BY_HEX.has(hex)));
+        if (valid.size) setActiveHexes(valid);
+      }
+      if (Array.isArray(project.completed)) setCompletedCells(new Set((project.completed as unknown[]).filter((key): key is string => typeof key === "string")));
+      if (typeof project.focusSeconds === "number") setFocusSeconds(Math.max(0, Math.round(project.focusSeconds)));
+      setFileName(typeof project.name === "string" ? project.name : file.name);
+      setRestoreNote("工程已导入；可继续编辑、施工与导出。");
+    } catch {
+      window.alert("工程文件无法读取，请确认它由豆搭导出且内容完整。");
+    }
+  };
+
+  const importMatrix = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const lines = (await file.text()).replace(/^\uFEFF/, "").trim().split(/\r?\n/);
+      if (!/^row,column,hex/i.test(lines[0] || "")) throw new Error("header");
+      const cells = lines.slice(1).map((line) => line.split(","));
+      const height = Math.max(...cells.map((columns) => Number(columns[0]) || 0));
+      const width = Math.max(...cells.map((columns) => Number(columns[1]) || 0));
+      if (width < 1 || height < 1 || width > 100 || height > 100) throw new Error("size");
+      const next: Grid = Array.from({ length: height }, () => Array.from({ length: width }, () => ({ color: null, external: true })));
+      cells.forEach((columns) => {
+        const y = Number(columns[0]) - 1;
+        const x = Number(columns[1]) - 1;
+        const color = PALETTE_BY_HEX.get((columns[2] || "").toUpperCase()) || null;
+        if (next[y]?.[x] && color) next[y][x] = { color, external: false };
+      });
+      sourceImageRef.current = null;
+      setSourceVersion(0);
+      setSourcePreview("");
+      setGrid(next);
+      setUndoStack([]);
+      setRedoStack([]);
+      setCompletedCells(new Set());
+      setFileName(file.name);
+      setRestoreNote("矩阵 CSV 已导入。");
+    } catch {
+      window.alert("矩阵 CSV 无法读取，请使用豆搭导出的矩阵 CSV。");
+    }
+  };
+
+  const openInventory = () => {
+    setInventoryDraft(new Set(activeHexes));
+    setInventoryOpen(true);
+  };
+
+  const applyInventory = () => {
+    if (!inventoryDraft.size) {
+      window.alert("至少保留一种库存色。");
+      return;
+    }
+    const palette = BEAD_PALETTE.filter((color) => inventoryDraft.has(color.hex));
+    if (!hasSource && grid.length) {
+      pushHistory();
+      setGrid((current) => current.map((row) => row.map((cell) => {
+        if (cell.external || !cell.color || inventoryDraft.has(cell.color.hex)) return { ...cell };
+        return { ...cell, color: nearestColor(rgbFromHex(cell.color.hex), palette) };
+      })));
+    }
+    setActiveHexes(new Set(inventoryDraft));
+    setInventoryOpen(false);
+  };
+
+  const filteredInventory = useMemo(() => {
+    const query = inventorySearch.trim().toLowerCase();
+    if (!query) return BEAD_PALETTE;
+    return BEAD_PALETTE.filter((color) => {
+      const values = [color.name, color.hex, ...BRAND_OPTIONS.map((item) => color.codes[item])];
+      return values.some((value) => value.toLowerCase().includes(query));
     });
-    return canvas;
+  }, [inventorySearch]);
+
+  const removeColor = (color: BeadColor) => {
+    const remaining = activePalette.filter((item) => item.hex !== color.hex);
+    if (!remaining.length) return;
+    pushHistory();
+    setGrid((current) => replaceGridColor(current, color.hex, nearestColor(rgbFromHex(color.hex), remaining)));
+    setActiveHexes((current) => {
+      const next = new Set(current);
+      next.delete(color.hex);
+      return next;
+    });
   };
 
-  const exportPng = () => {
-    if (!grid.length) return;
-    renderExportCanvas().toBlob((blob) => blob && downloadBlob(blob, `豆搭-${settings.size}x${settings.size}-图纸.png`));
-    setExportOpen(false);
-  };
-
-  const exportCsv = () => {
-    const rows = [
-      ["品牌", "色号", "颜色名", "HEX", "数量"],
-      ...colorStats.map((item) => [brand, item.color.codes[brand], item.color.name, item.color.hex, String(item.count)]),
-      ["", "", "合计", "", String(totalBeads)],
-    ];
-    const csv = `\ufeff${rows.map((row) => row.map((value) => `"${value.replaceAll('"', '""')}"`).join(",")).join("\n")}`;
-    downloadBlob(new Blob([csv], { type: "text/csv;charset=utf-8" }), `豆搭-${brand}-采购清单.csv`);
-    setExportOpen(false);
-  };
-
-  const printPattern = () => {
-    if (!grid.length) return;
-    const dataUrl = renderExportCanvas().toDataURL("image/png");
-    const printWindow = window.open("", "_blank");
-    if (!printWindow) return;
-    printWindow.document.write(`<html><head><title>豆搭拼豆图纸</title><style>body{margin:0;display:grid;place-items:center}img{max-width:100%;height:auto}@media print{img{width:100%}}</style></head><body><img src="${dataUrl}" onload="window.print()" /></body></html>`);
-    printWindow.document.close();
-    setExportOpen(false);
-  };
-
-  const candidateDetails = (size: number) => {
-    const beads = Math.round(size * size * occupiedRatio);
-    return {
-      beads,
-      minutes: beads * 0.11,
-      cost: Math.max(3, beads * 0.018),
-    };
-  };
-
-  const candidate29 = candidateDetails(29);
-  const candidate58 = candidateDetails(58);
+  const exportProject = () => exportProjectJson(grid, {
+    name: fileName,
+    settings,
+    transform,
+    brand,
+    activePalette: [...activeHexes],
+    completed: [...completedCells],
+    focusSeconds,
+  });
 
   return (
-    <main className={`app-shell ${focusMode ? "is-focus" : ""}`}>
+    <main className={"app-shell" + (focusMode ? " is-focus" : "")}>
       <header className="topbar">
-        <button className="brand-mark" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })} aria-label="回到顶部">
+        <button className="brand-mark" type="button" aria-label="豆搭首页" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}>
           <span className="brand-beads" aria-hidden="true"><i /><i /><i /><i /></span>
-          <span><b>豆搭</b><small>BEAD STUDIO</small></span>
+          <span><b>豆搭</b><small>PERLER STUDIO</small></span>
         </button>
-        <nav className="top-actions" aria-label="顶部操作">
-          {hasImage && <span className="privacy-note"><i />图片仅在本机处理</span>}
-          {hasImage && (
-            <button className="ghost-button" onClick={() => fileInputRef.current?.click()}>换一张图</button>
-          )}
-          {hasImage && (
-            <button className="dark-button" onClick={() => setFocusMode(true)}>◉ 专心拼豆</button>
-          )}
-        </nav>
+        <div className="top-actions">
+          <span className="privacy-note"><i />图片只在本机处理</span>
+          <button className="ghost-button" type="button" onClick={() => projectInputRef.current?.click()}>导入工程</button>
+          <button className="dark-button" type="button" onClick={() => fileInputRef.current?.click()}>{hasWorkspace ? "换一张图" : "开始制作"}</button>
+        </div>
       </header>
+      <input ref={fileInputRef} className="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={(event) => acceptFile(event.target.files?.[0])} />
+      <input ref={projectInputRef} className="visually-hidden" type="file" accept="application/json,.json" onChange={importProject} />
+      <input ref={matrixInputRef} className="visually-hidden" type="file" accept="text/csv,.csv" onChange={importMatrix} />
 
-      {!hasImage ? (
+      {!hasWorkspace ? (
         <section className="landing">
           <div className="hero-copy">
-            <span className="eyebrow"><i /> 一句话，把照片变成真正能拼的图纸</span>
-            <h1>把你想留住的，<br /><em>一颗颗拼出来。</em></h1>
-            <p>上传人像、宠物或旅行照，自动清理背景、匹配实体豆色号，还可以直接说“颜色少一点”继续修改。</p>
-            <div className="feature-line">
-              <span>29 / 58 格方案</span><span>真实品牌色号</span><span>PNG / CSV 导出</span>
-            </div>
+            <span className="eyebrow"><i />从照片到可施工图纸</span>
+            <h1>把你想留住的<br />变成一颗颗<em>拼豆</em></h1>
+            <p>上传照片，豆搭会在浏览器里完成取色、去背景与色号匹配。你可以逐格修正、按库存限色、保存工程，再导出带坐标和分板线的制作图。</p>
+            <div className="feature-line"><span>291 色 · 5 品牌</span><span>透明 PNG 友好</span><span>工程自动恢复</span><span>本地处理</span></div>
           </div>
-
           <div className="upload-stage">
             <div className="mosaic-shadow" />
             <div className="mini-mosaic" aria-hidden="true">
-              {DEMO_PATTERN.flatMap((row, y) => row.split("").map((code, x) => (
-                <i key={`${x}-${y}`} data-code={code} />
-              )))}
+              {DEMO_PATTERN.flatMap((row, y) => row.split("").map((code, x) => <i key={cellKey(x, y)} data-code={code} />))}
             </div>
             <div
-              className={`upload-card ${dragging ? "is-dragging" : ""}`}
-              onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
+              className={"upload-card" + (dragging ? " is-dragging" : "")}
+              onDragOver={(event: DragEvent<HTMLDivElement>) => { event.preventDefault(); setDragging(true); }}
               onDragLeave={() => setDragging(false)}
-              onDrop={(event: DragEvent<HTMLDivElement>) => {
-                event.preventDefault();
-                setDragging(false);
-                acceptFile(event.dataTransfer.files[0]);
-              }}
+              onDrop={(event: DragEvent<HTMLDivElement>) => { event.preventDefault(); setDragging(false); acceptFile(event.dataTransfer.files[0]); }}
             >
-              <span className="upload-icon" aria-hidden="true">↑</span>
+              <div className="upload-icon" aria-hidden="true">＋</div>
               <h2>上传一张照片</h2>
-              <p>拖到这里，或选择 JPG、PNG 图片</p>
-              <button className="primary-button" onClick={() => fileInputRef.current?.click()}>选择图片</button>
-              <button className="text-button" onClick={loadDemo}>没有图片？试试小猫示例 →</button>
-              <small>无需登录 · 不上传原图 · 免费导出</small>
+              <p>拖到这里，或从设备选择图片</p>
+              <button className="primary-button" type="button" onClick={() => fileInputRef.current?.click()}>选择图片</button>
+              <button className="text-button" type="button" onClick={loadDemo}>先用示例体验完整流程 →</button>
+              <small>支持 PNG / JPG / WebP · 最大 20MB · 不上传服务器</small>
             </div>
           </div>
-
-          <div className="landing-bottom">
-            <span>01 上传照片</span><i />
-            <span>02 说出想要的效果</span><i />
-            <span>03 带着图纸去拼豆</span>
-          </div>
+          <div className="landing-bottom"><span>取色</span><i /><span>编辑</span><i /><span>备料</span><i /><span>施工</span></div>
         </section>
       ) : (
         <section className="studio">
-          <aside className="left-panel panel">
+          <aside className="panel left-panel">
             <div className="panel-heading">
-              <div><span className="step-kicker">STEP 01</span><h2>选择制作方案</h2></div>
-              <span className="file-chip" title={fileName}>已导入</span>
+              <span><small className="step-kicker">01 · 生成设置</small><h2>图纸规格</h2></span>
+              <span className="file-chip">{hasSource ? "原图就绪" : "工程模式"}</span>
             </div>
-            <div className="source-thumb">
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={sourcePreview} alt="已上传的原图预览" />
-              <span>{fileName}</span>
-            </div>
-            <h3 className="section-label">尺寸对比</h3>
-            <button className={`candidate-card ${settings.size === 29 ? "is-selected" : ""}`} onClick={() => setSettings((value) => ({ ...value, size: 29 }))}>
-              <span className="radio-dot" />
-              <span className="candidate-main"><b>29 × 29</b><small>快速入门 · 约 14.5 cm</small></span>
-              <strong>{candidate29.beads}<small>颗</small></strong>
-              <span className="candidate-meta"><i>{formatTime(candidate29.minutes)}</i><i>材料约 ¥{candidate29.cost.toFixed(0)}</i></span>
-            </button>
-            <button className={`candidate-card ${settings.size === 58 ? "is-selected" : ""}`} onClick={() => setSettings((value) => ({ ...value, size: 58 }))}>
-              <span className="radio-dot" />
-              <span className="candidate-main"><b>58 × 58</b><small>细节丰富 · 约 29 cm</small></span>
-              <strong>{candidate58.beads}<small>颗</small></strong>
-              <span className="candidate-meta"><i>{formatTime(candidate58.minutes)}</i><i>材料约 ¥{candidate58.cost.toFixed(0)}</i></span>
-            </button>
-
-            <div className="control-group">
-              <div className="control-title"><span>颜色数量</span><b>{settings.colorLimit} 色</b></div>
-              <input type="range" min="6" max="36" value={settings.colorLimit} onChange={(event) => setSettings((value) => ({ ...value, colorLimit: Number(event.target.value) }))} />
-              <div className="range-labels"><span>更好制作</span><span>更多细节</span></div>
+            {sourcePreview ? <div className="source-thumb"><span className="source-thumb-image" role="img" aria-label="上传原图预览" style={{ backgroundImage: "url(" + sourcePreview + ")" }} /><span>{fileName}</span></div> : <p className="restore-note">{restoreNote || fileName}</p>}
+            <p className="section-label">板面宽度</p>
+            <div className="size-presets">
+              {[29, 58].map((value) => (
+                <button key={value} type="button" className={settings.width === value ? "active" : ""} onClick={() => setSettings((current) => ({ ...current, width: value }))}>
+                  <b>{value} 格</b><small>{value === 29 ? "单板" : "2 × 2 板宽"}</small>
+                </button>
+              ))}
             </div>
             <div className="control-group">
-              <div className="control-title"><span>杂色合并</span><b>{settings.merge}</b></div>
-              <input type="range" min="0" max="70" value={settings.merge} onChange={(event) => setSettings((value) => ({ ...value, merge: Number(event.target.value) }))} />
-              <div className="range-labels"><span>保留细节</span><span>色块干净</span></div>
+              <div className="control-title"><span>自定义宽度</span><b>{settings.width} 格</b></div>
+              <input aria-label="自定义板面宽度" type="range" min="16" max="100" value={settings.width} onChange={(event) => setSettings((current) => ({ ...current, width: Number(event.target.value) }))} />
             </div>
-            <label className="toggle-row">
-              <span><b>自动清理背景</b><small>去掉与图片边缘相连的底色</small></span>
-              <input type="checkbox" checked={settings.removeBackground} onChange={(event) => setSettings((value) => ({ ...value, removeBackground: event.target.checked }))} />
-              <i />
+            <label className="toggle-row" aria-label="保持原图比例">
+              <span><b>保持原图比例</b><small>输出 N × M 图纸，不强制裁方形</small></span>
+              <input type="checkbox" checked={settings.preserveAspect} onChange={(event) => setSettings((current) => ({ ...current, preserveAspect: event.target.checked }))} /><i />
             </label>
-            <div className="fit-switch" aria-label="图片适配方式">
-              <button className={settings.fit === "cover" ? "active" : ""} onClick={() => setSettings((value) => ({ ...value, fit: "cover" }))}>填满画布</button>
-              <button className={settings.fit === "contain" ? "active" : ""} onClick={() => setSettings((value) => ({ ...value, fit: "contain" }))}>保留全图</button>
+            {!settings.preserveAspect && (
+              <>
+                <div className="fit-switch">
+                  <button type="button" className={settings.fit === "cover" ? "active" : ""} onClick={() => setSettings((current) => ({ ...current, fit: "cover" }))}>铺满裁切</button>
+                  <button type="button" className={settings.fit === "contain" ? "active" : ""} onClick={() => setSettings((current) => ({ ...current, fit: "contain" }))}>完整留白</button>
+                </div>
+                {settings.fit === "cover" && <div className="crop-controls">
+                  <label>水平焦点<input aria-label="裁切水平焦点" type="range" min="0" max="100" value={settings.cropX} onChange={(event) => setSettings((current) => ({ ...current, cropX: Number(event.target.value) }))} /></label>
+                  <label>垂直焦点<input aria-label="裁切垂直焦点" type="range" min="0" max="100" value={settings.cropY} onChange={(event) => setSettings((current) => ({ ...current, cropY: Number(event.target.value) }))} /></label>
+                </div>}
+              </>
+            )}
+            <div className="transform-row">
+              <button type="button" onClick={() => setTransform((current) => ({ ...current, rotation: (current.rotation + 90) % 360 as Transform["rotation"] }))}>↻ 旋转</button>
+              <button type="button" className={transform.flipX ? "active" : ""} onClick={() => setTransform((current) => ({ ...current, flipX: !current.flipX }))}>↔ 水平</button>
+              <button type="button" className={transform.flipY ? "active" : ""} onClick={() => setTransform((current) => ({ ...current, flipY: !current.flipY }))}>↕ 垂直</button>
             </div>
-            <p className="estimate-note">估算按 5mm 豆、手工摆放测算，实际时间与材料价格会因人和门店不同。</p>
+            <div className="control-group">
+              <div className="control-title"><span>颜色上限</span><b>{settings.colorLimit} 色</b></div>
+              <input aria-label="颜色上限" type="range" min="2" max="40" value={settings.colorLimit} onChange={(event) => setSettings((current) => ({ ...current, colorLimit: Number(event.target.value) }))} />
+            </div>
+            <div className="control-group">
+              <div className="control-title"><span>碎色合并</span><b>{settings.mergeStrength}</b></div>
+              <input aria-label="碎色合并强度" type="range" min="0" max="60" value={settings.mergeStrength} onChange={(event) => setSettings((current) => ({ ...current, mergeStrength: Number(event.target.value) }))} />
+            </div>
+            <div className="fit-switch">
+              <button type="button" className={settings.sampleMode === "dominant" ? "active" : ""} onClick={() => setSettings((current) => ({ ...current, sampleMode: "dominant" }))}>主体色取样</button>
+              <button type="button" className={settings.sampleMode === "average" ? "active" : ""} onClick={() => setSettings((current) => ({ ...current, sampleMode: "average" }))}>平均色取样</button>
+            </div>
+            <label className="toggle-row" aria-label="自动去背景">
+              <span><b>自动去背景</b><small>先识别边缘背景，再执行限色</small></span>
+              <input type="checkbox" checked={settings.removeBackground} onChange={(event) => setSettings((current) => ({ ...current, removeBackground: event.target.checked }))} /><i />
+            </label>
+            {settings.removeBackground && <div className="control-group compact-control">
+              <div className="control-title"><span>背景容差</span><b>{settings.backgroundTolerance}</b></div>
+              <input aria-label="去背景容差" type="range" min="8" max="90" value={settings.backgroundTolerance} onChange={(event) => setSettings((current) => ({ ...current, backgroundTolerance: Number(event.target.value) }))} />
+            </div>}
+            <button className="inventory-button" type="button" onClick={openInventory}><span>库存色板</span><b>{activeHexes.size} / {BEAD_PALETTE.length} 色</b></button>
+            <p className="estimate-note">当前约需 <b>{totalBeads}</b> 颗，预计 {formatTime(totalBeads * 0.11)}。开工前请对照实物色卡。</p>
           </aside>
 
-          <section className="canvas-panel panel">
+          <section className="panel canvas-panel">
             <div className="canvas-topline">
-              <div><span className="step-kicker">STEP 02</span><h2>预览与精修</h2></div>
-              <div className="canvas-status">
-                <span>{settings.size} × {settings.size}</span><i />
-                <span>{colorStats.length} 色</span><i />
-                <span>{totalBeads} 颗</span>
-              </div>
+              <span><small className="step-kicker">02 · 精修图纸</small><h2>{fileName || "未命名工程"}</h2></span>
+              <div className="canvas-status"><b>{grid[0]?.length || 0} × {grid.length}</b><i /><span>{stats.length} 色</span><i /><span>{totalBeads} 颗</span></div>
             </div>
-            <div className="toolbar" role="toolbar" aria-label="图纸编辑工具">
+            {restoreNote && <div className="inline-notice">{restoreNote}<button type="button" onClick={() => setRestoreNote("")}>×</button></div>}
+            <div className="toolbar" role="toolbar" aria-label="拼豆编辑工具">
               {([
-                ["paint", "●", "画笔"],
-                ["erase", "◇", "橡皮"],
-                ["picker", "◎", "取色"],
-                ["replace", "⇄", "换色"],
-              ] as Array<[Tool, string, string]>).map(([value, icon, label]) => (
-                <button key={value} className={tool === value ? "active" : ""} onClick={() => setTool(value)} title={label}><span>{icon}</span>{label}</button>
-              ))}
-              <span className="toolbar-divider" />
-              <button onClick={undo} disabled={!undoStack.length} title="撤销"><span>↶</span></button>
-              <button onClick={redo} disabled={!redoStack.length} title="重做"><span>↷</span></button>
-              <label className="code-toggle"><input type="checkbox" checked={showCodes} onChange={(event) => setShowCodes(event.target.checked)} /> 显示色号</label>
+                ["paint", "✎", "画笔"], ["erase", "⌫", "橡皮"], ["region", "◉", "区域擦除"],
+                ["picker", "⌾", "吸色"], ["replace", "⇄", "全局替换"],
+              ] as const).map((item) => <button key={item[0]} type="button" className={tool === item[0] ? "active" : ""} onClick={() => setTool(item[0])}><span>{item[1]}</span>{item[2]}</button>)}
+              <div className="toolbar-divider" />
+              <button type="button" disabled={!undoStack.length} onClick={undo}><span>↶</span>撤销</button>
+              <button type="button" disabled={!redoStack.length} onClick={redo}><span>↷</span>重做</button>
+              <label className="code-toggle"><input type="checkbox" checked={showCodes} onChange={(event) => setShowCodes(event.target.checked)} />显示色号</label>
             </div>
             <div className="canvas-frame">
-              {processing && <div className="processing"><span /><b>正在重新计算图纸…</b></div>}
+              {processing && <div className="processing"><span /><b>正在重算取色与图纸…</b></div>}
               <div className="canvas-scroller">
                 <canvas
                   ref={canvasRef}
-                  aria-label="可编辑的拼豆图纸"
+                  aria-label="可编辑拼豆图纸"
                   onPointerDown={(event) => {
                     const target = cellFromEvent(event);
                     if (!target) return;
-                    isDrawingRef.current = true;
                     event.currentTarget.setPointerCapture(event.pointerId);
+                    isDrawingRef.current = tool === "paint" || tool === "erase";
                     editCell(target.x, target.y, true);
                   }}
                   onPointerMove={(event) => {
                     const target = cellFromEvent(event);
                     setHovered(target);
-                    if (isDrawingRef.current && target && !focusMode && (tool === "paint" || tool === "erase")) editCell(target.x, target.y, false);
+                    if (target && isDrawingRef.current) editCell(target.x, target.y, false);
                   }}
+                  onPointerLeave={() => { setHovered(null); isDrawingRef.current = false; }}
                   onPointerUp={() => { isDrawingRef.current = false; }}
-                  onPointerLeave={() => { isDrawingRef.current = false; setHovered(null); }}
                 />
               </div>
-              {hovered?.cell.color && !hovered.cell.external && (
-                <div className="hover-card">
-                  <i style={{ background: hovered.cell.color.hex }} />
-                  <span><b>{hovered.cell.color.codes[brand]} · {hovered.cell.color.name}</b><small>第 {hovered.x + 1} 列 / {hovered.y + 1} 行</small></span>
-                </div>
-              )}
-              <div className="zoom-control"><span>−</span><input type="range" min="65" max="180" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /><span>＋</span><b>{zoom}%</b></div>
+              {hovered && <div className="hover-card"><i style={{ background: hovered.cell.color?.hex || "#eee" }} /><span><b>第 {hovered.y + 1} 行 · 第 {hovered.x + 1} 列</b><small>{hovered.cell.external || !hovered.cell.color ? "空格" : hovered.cell.color.codes[brand] + " · " + hovered.cell.color.name}</small></span></div>}
+              <div className="zoom-control"><span>−</span><input aria-label="画布缩放" type="range" min="55" max="180" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /><span>＋</span><b>{zoom}%</b></div>
             </div>
-
             <div className="palette-strip">
               <div className="palette-title"><span>当前画笔</span><b>{selectedColor.codes[brand]} · {selectedColor.name}</b><i style={{ background: selectedColor.hex }} /></div>
-              <div className="swatches" role="list" aria-label="可选拼豆颜色">
-                {BEAD_PALETTE.map((color) => (
-                  <button key={color.hex} style={{ background: color.hex }} className={selectedColor.hex === color.hex ? "selected" : ""} onClick={() => { setSelectedColor(color); setTool("paint"); }} title={`${color.codes[brand]} ${color.name}`} aria-label={`${color.codes[brand]} ${color.name}`} />
-                ))}
+              <div className="swatches">
+                {stats.map((item) => <button key={item.color.hex} type="button" aria-label={"选择 " + item.color.name} title={item.color.codes[brand] + " · " + item.color.name} className={selectedColor.hex === item.color.hex ? "selected" : ""} style={{ background: item.color.hex }} onClick={() => setSelectedColor(item.color)} />)}
+                <button type="button" className="more-swatch" aria-label="打开完整库存色板" onClick={openInventory}>＋</button>
               </div>
             </div>
           </section>
 
-          <aside className="right-panel panel">
+          <aside className="panel right-panel">
             <div className="panel-heading">
-              <div><span className="step-kicker">STEP 03</span><h2>用话修改效果</h2></div>
-              <span className="local-ai">本地计算</span>
+              <span><small className="step-kicker">03 · 备料与施工</small><h2>交付中心</h2></span>
+              <span className="local-ai">本地规则助手</span>
             </div>
-            <div className="assistant-bubble">
-              <span>豆</span>
-              <p>{promptNotes.length ? `已完成：${promptNotes.join("；")} 。你还可以继续告诉我要怎么改。` : "试试告诉我：“只保留主体，颜色少一点，轮廓更清晰”。"}</p>
-            </div>
+            <div className="assistant-bubble"><span>豆</span><p>{assistantNote || "用中文快速调参。只有识别成功的指令才会修改图纸。"}</p></div>
             <div className="prompt-box">
-              <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") applyPrompt(); }} placeholder="例如：去掉背景，让颜色更鲜艳，控制在 12 色左右…" />
-              <button onClick={applyPrompt} disabled={!prompt.trim()} aria-label="应用文字修改">↑</button>
+              <textarea aria-label="本地规则指令" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="例如：限制 12 色，去背景，减少杂色…" />
+              <button type="button" aria-label="应用指令" disabled={!prompt.trim()} onClick={applyPrompt}>↑</button>
             </div>
-            <div className="quick-prompts">
-              {["去掉杂乱背景", "颜色少一点", "轮廓更清晰", "换成 58×58"].map((text) => (
-                <button key={text} onClick={() => setPrompt(text)}>+ {text}</button>
-              ))}
-            </div>
-            <p className="ai-boundary">当前版本能理解尺寸、背景、颜色数量、明暗和轮廓类要求；对“只修改眼睛”等部位级语义指令仍是演示能力。</p>
-
+            <div className="quick-prompts">{["限制 12 色", "主体完整", "减少杂色", "更鲜艳"].map((value) => <button key={value} type="button" onClick={() => setPrompt(value)}>{value}</button>)}</div>
+            <p className="ai-boundary">这是可解释的本地规则，不发送图片或指令，也不会把未识别指令伪装成已执行。</p>
             <div className="divider" />
-            <div className="brand-select-row"><span><b>豆子品牌</b><small>切换图纸上的实体色号</small></span></div>
-            <div className="brand-tabs">
-              {BRAND_OPTIONS.map((option) => <button key={option} className={brand === option ? "active" : ""} onClick={() => setBrand(option)}>{option}</button>)}
-            </div>
-
-            <div className="divider" />
-            <div className="summary-head"><span><b>用豆清单</b><small>{colorStats.length} 种颜色</small></span><strong>{totalBeads}<small>颗</small></strong></div>
+            <div className="brand-select-row"><span><b>品牌色号</b><small>共 {BEAD_PALETTE.length} 色，购买前核对实物色卡</small></span></div>
+            <div className="brand-tabs five-tabs">{BRAND_OPTIONS.map((item) => <button key={item} type="button" className={brand === item ? "active" : ""} onClick={() => setBrand(item)}>{item}</button>)}</div>
+            <div className="summary-head"><span><b>用色清单</b><small>点击设画笔，× 可移出库存</small></span><strong>{totalBeads}<small>颗</small></strong></div>
             <div className="color-list">
-              {colorStats.slice(0, 8).map((item) => (
-                <button key={item.color.hex} onClick={() => { setSelectedColor(item.color); setTool("paint"); }}>
-                  <i style={{ background: item.color.hex }} />
-                  <span><b>{item.color.codes[brand]}</b><small>{item.color.name}</small></span>
-                  <strong>{item.count}</strong>
-                  <em style={{ width: `${Math.max(8, (item.count / (colorStats[0]?.count || 1)) * 100)}%` }} />
+              {stats.slice(0, 12).map((item) => <div className="color-list-row" key={item.color.hex}>
+                <button type="button" onClick={() => setSelectedColor(item.color)}>
+                  <i style={{ background: item.color.hex }} /><span><b>{item.color.codes[brand]} · {item.color.name}</b><small>{item.color.hex}</small></span><strong>{item.count}</strong>
+                  <em style={{ width: Math.max(4, item.count / Math.max(1, stats[0]?.count || 1) * 100) + "%" }} />
                 </button>
-              ))}
+                <button className="exclude-color" type="button" aria-label={"移出 " + item.color.name} title="移出库存并匹配到最接近颜色" onClick={() => removeColor(item.color)}>×</button>
+              </div>)}
             </div>
-            {colorStats.length > 8 && <p className="more-colors">还有 {colorStats.length - 8} 种颜色，可在采购清单中查看</p>}
-            <div className="result-summary">
-              <span><small>成品尺寸</small><b>{(settings.size * 0.5).toFixed(1)} × {(settings.size * 0.5).toFixed(1)} cm</b></span>
-              <span><small>预计制作</small><b>{formatTime(makeMinutes).replace("约 ", "")}</b></span>
-            </div>
+            {stats.length > 12 && <button className="more-colors" type="button" onClick={openInventory}>另有 {stats.length - 12} 种颜色 · 查看完整色板</button>}
+            <div className="result-summary"><span><small>预计耗时</small><b>{formatTime(totalBeads * 0.11)}</b></span><span><small>备料建议</small><b>{Math.ceil(totalBeads * 1.08)} 颗</b></span></div>
+            <button className="focus-button" type="button" onClick={() => { setFocusMode(true); setTimerRunning(true); }}>◎ 进入专注制作模式</button>
             <div className="export-wrap">
-              <button className="export-main" onClick={exportPng}>下载带色号图纸 <span>PNG</span></button>
-              <button className="export-toggle" onClick={() => setExportOpen((open) => !open)} aria-label="展开其他导出选项">⌄</button>
-              {exportOpen && (
-                <div className="export-menu">
-                  <button onClick={exportCsv}><b>采购清单</b><small>CSV 表格</small></button>
-                  <button onClick={printPattern}><b>打印 / 存为 PDF</b><small>浏览器打印</small></button>
-                </div>
-              )}
+              <button className="export-main" type="button" onClick={() => exportGuidePng(grid, brand)}>下载施工图 <span>PNG</span></button>
+              <button className="export-toggle" type="button" aria-label="打开更多导出选项" onClick={() => setExportOpen((value) => !value)}>⌃</button>
+              {exportOpen && <div className="export-menu">
+                <button type="button" onClick={() => exportGuidePng(grid, brand)}><b>坐标施工图 PNG</b><small>分板线与用色图例</small></button>
+                <button type="button" onClick={() => exportBomCsv(grid, brand)}><b>采购清单 CSV</b><small>真实用量与 8% 余量</small></button>
+                <button type="button" onClick={() => exportMatrixCsv(grid, brand)}><b>矩阵数据 CSV</b><small>逐格坐标，可再次导入</small></button>
+                <button type="button" onClick={exportProject}><b>可恢复工程 JSON</b><small>设置、矩阵与进度</small></button>
+                <button type="button" onClick={() => matrixInputRef.current?.click()}><b>导入矩阵 CSV</b><small>继续编辑已有矩阵</small></button>
+              </div>}
             </div>
-            <small className="palette-disclaimer">色号为原型映射，实体制作前请对照品牌最新实物色卡。</small>
+            <small className="palette-disclaimer">预览、清单、施工图和工程文件全部来自同一份当前矩阵。</small>
           </aside>
         </section>
       )}
 
-      <input ref={fileInputRef} className="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event: ChangeEvent<HTMLInputElement>) => { acceptFile(event.target.files?.[0]); event.target.value = ""; }} />
+      {focusMode && <div className="focus-bar">
+        <button type="button" onClick={() => { setFocusMode(false); setTimerRunning(false); }}>← 退出专注</button>
+        <span><b>点击格子标记已完成</b><small>按颜色筛选后，其余颜色会自动淡化</small></span>
+        <label className="focus-filter">只看颜色<select value={focusColor} onChange={(event) => setFocusColor(event.target.value)}>
+          <option value="">全部颜色</option>
+          {stats.map((item) => <option key={item.color.hex} value={item.color.hex}>{item.color.codes[brand]} · {item.count} 颗</option>)}
+        </select></label>
+        <button type="button" onClick={() => setTimerRunning((value) => !value)}>{timerRunning ? "暂停" : "继续"} {formatClock(focusSeconds)}</button>
+        <div className="focus-progress"><i><em style={{ width: focusProgress + "%" }} /></i><b>{focusProgress}%</b><small>{focusedDone} / {focusedTotal} 颗已标记</small></div>
+        <button className="reset-progress" type="button" onClick={() => setCompletedCells(new Set())}>重置进度</button>
+      </div>}
 
-      {focusMode && (
-        <div className="focus-bar">
-          <button onClick={() => setFocusMode(false)}>← 返回编辑</button>
-          <span><b>专心拼豆</b><small>点击已摆放的格子标记进度</small></span>
-          <div className="focus-progress"><i><em style={{ width: `${focusProgress}%` }} /></i><b>{focusProgress}%</b><small>{completedCount} / {totalBeads} 颗</small></div>
-          <button className="reset-progress" onClick={() => setCompletedCells(new Set())}>清空进度</button>
-        </div>
-      )}
+      {inventoryOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setInventoryOpen(false); }}>
+        <section className="inventory-modal" role="dialog" aria-modal="true" aria-labelledby="inventory-title">
+          <header><span><small>库存驱动取色</small><h2 id="inventory-title">选择手上真实拥有的颜色</h2></span><button type="button" aria-label="关闭库存色板" onClick={() => setInventoryOpen(false)}>×</button></header>
+          <div className="inventory-tools">
+            <input aria-label="搜索颜色或色号" value={inventorySearch} onChange={(event) => setInventorySearch(event.target.value)} placeholder={"搜索名称、HEX 或 " + brand + " 色号"} />
+            <button type="button" onClick={() => setInventoryDraft(new Set(BEAD_PALETTE.map((color) => color.hex)))}>全选</button>
+            <button type="button" onClick={() => setInventoryDraft(new Set(stats.map((item) => item.color.hex)))}>仅当前用色</button>
+          </div>
+          <p className="inventory-count">已选 {inventoryDraft.size} / {BEAD_PALETTE.length} 色 · 当前显示 {filteredInventory.length} 色</p>
+          <div className="inventory-grid">
+            {filteredInventory.map((color) => {
+              const selected = inventoryDraft.has(color.hex);
+              return <button key={color.hex} type="button" className={selected ? "selected" : ""} onClick={() => setInventoryDraft((current) => {
+                const next = new Set(current);
+                if (next.has(color.hex)) next.delete(color.hex); else next.add(color.hex);
+                return next;
+              })}><i style={{ background: color.hex }} /><span><b>{color.codes[brand]}</b><small>{color.name}</small></span><em>{selected ? "✓" : ""}</em></button>;
+            })}
+          </div>
+          <footer><span>应用后只使用所选库存色，缺色会匹配到最近库存色。</span><button type="button" onClick={applyInventory}>应用库存色板</button></footer>
+        </section>
+      </div>}
     </main>
   );
 }

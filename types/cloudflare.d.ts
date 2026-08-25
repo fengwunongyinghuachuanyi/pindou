@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 declare module "cloudflare:workers" {
   export const env: Record<string, any>;
 }

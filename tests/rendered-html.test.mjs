@@ -35,5 +35,5 @@ test("removes all disposable starter surfaces", async () => {
   assert.match(page, /豆搭/);
   assert.match(layout, /照片转拼豆图纸/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton|site-creator-vinext-starter/);
-  await assert.rejects(access(new URL("app\/_sites-preview", root)));
+  await assert.rejects(access(new URL("app/_sites-preview", root)));
 });
