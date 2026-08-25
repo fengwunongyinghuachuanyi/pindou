@@ -1,4 +1,4 @@
-/** Cloudflare Worker entry point for the 豆搭 site. */
+/** Cloudflare Worker entry point for the 拼豆 site. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
 

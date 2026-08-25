@@ -30,7 +30,7 @@ export function exportBomCsv(grid: Grid, brand: Brand) {
     ...stats.map((item) => [brand, item.color.codes[brand], item.color.name, item.color.hex, item.count, Math.ceil(item.count * 1.08)].map(csvCell).join(",")),
     ["", "", "合计", "", total, Math.ceil(total * 1.08)].map(csvCell).join(","),
   ];
-  downloadBlob(new Blob(["\uFEFF" + rows.join("\n")], { type: "text/csv;charset=utf-8" }), "豆搭-" + brand + "-采购清单.csv");
+  downloadBlob(new Blob(["\uFEFF" + rows.join("\n")], { type: "text/csv;charset=utf-8" }), "拼豆-" + brand + "-采购清单.csv");
 }
 
 export function exportMatrixCsv(grid: Grid, brand: Brand) {
@@ -46,7 +46,7 @@ export function exportMatrixCsv(grid: Grid, brand: Brand) {
       cell.external || !cell.color ? "empty" : "bead",
     ].map(csvCell).join(","));
   }));
-  downloadBlob(new Blob(["\uFEFF" + rows.join("\n")], { type: "text/csv;charset=utf-8" }), "豆搭-" + grid[0].length + "x" + grid.length + "-矩阵.csv");
+  downloadBlob(new Blob(["\uFEFF" + rows.join("\n")], { type: "text/csv;charset=utf-8" }), "拼豆-" + grid[0].length + "x" + grid.length + "-矩阵.csv");
 }
 
 export function exportProjectJson(
@@ -62,10 +62,10 @@ export function exportProjectJson(
   },
 ) {
   const project = {
-    app: "豆搭",
+    app: "拼豆",
     version: 2,
     exportedAt: new Date().toISOString(),
-    name: options.name || "豆搭工程",
+    name: options.name || "拼豆工程",
     settings: options.settings,
     transform: options.transform,
     brand: options.brand,
@@ -74,7 +74,7 @@ export function exportProjectJson(
     focusSeconds: options.focusSeconds,
     grid: serializableGrid(grid),
   };
-  downloadBlob(new Blob([JSON.stringify(project, null, 2)], { type: "application/json" }), "豆搭-" + grid[0].length + "x" + grid.length + "-工程.json");
+  downloadBlob(new Blob([JSON.stringify(project, null, 2)], { type: "application/json" }), "拼豆-" + grid[0].length + "x" + grid.length + "-工程.json");
 }
 
 export function exportGuidePng(grid: Grid, brand: Brand) {
@@ -100,7 +100,7 @@ export function exportGuidePng(grid: Grid, brand: Brand) {
   context.fillRect(0, 0, width, height);
   context.fillStyle = "#183d31";
   context.font = "700 24px Arial, sans-serif";
-  context.fillText("豆搭制作图 · " + cols + " × " + rows, left, 32);
+  context.fillText("拼豆制作图 · " + cols + " × " + rows, left, 32);
   context.fillStyle = "#6b756f";
   context.font = "12px Arial, sans-serif";
   context.fillText(brand + " 色号 · " + stats.length + " 色 · " + total + " 颗 · 粗线每 5 格，深线每 29 格", left, 52);
@@ -171,6 +171,6 @@ export function exportGuidePng(grid: Grid, brand: Brand) {
     context.fillText(item.count + " 颗", x + Math.min(columnWidth - 55, 215), y);
   });
   canvas.toBlob((blob) => {
-    if (blob) downloadBlob(blob, "豆搭-" + cols + "x" + rows + "-" + brand + "-制作图.png");
+    if (blob) downloadBlob(blob, "拼豆-" + cols + "x" + rows + "-" + brand + "-制作图.png");
   }, "image/png");
 }

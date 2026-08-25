@@ -18,7 +18,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const host = incoming.get("x-forwarded-host") ?? incoming.get("host") ?? "localhost:3000";
   const protocol = incoming.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
   const origin = `${protocol}://${host}`;
-  const title = "豆搭 · 照片转拼豆图纸";
+  const title = "拼豆";
   const description = "上传照片，生成可编辑、可导出并匹配实体品牌色号的拼豆制作图纸。";
   const image = `${origin}/og.png`;
   return {

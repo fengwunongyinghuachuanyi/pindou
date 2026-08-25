@@ -47,7 +47,8 @@ const INITIAL_SETTINGS: EngineSettings = {
   cropY: 50,
 };
 const INITIAL_TRANSFORM: Transform = { rotation: 0, flipX: false, flipY: false };
-const STORAGE_KEY = "doudap-project-v2";
+const STORAGE_KEY = "pindou-project-v2";
+const LEGACY_STORAGE_KEY = "doudap-project-v2";
 const DEMO_PATTERN = [
   "............", "...PP..PP...", "..PPPPPPPP..", ".PPWWPPWWPP.", ".PPBKPPKBPP.",
   ".PPPPPPPPPP.", "..PPWPPWPP..", "...PPRRPP...", "....PPPP....", "....GPPG....",
@@ -193,7 +194,7 @@ export default function Home() {
     restoredRef.current = true;
     const timer = window.setTimeout(() => {
       try {
-        const saved = window.localStorage.getItem(STORAGE_KEY);
+      const saved = window.localStorage.getItem(STORAGE_KEY) ?? window.localStorage.getItem(LEGACY_STORAGE_KEY);
         if (!saved) return;
         const project = JSON.parse(saved) as Record<string, unknown>;
         const savedGrid = sanitizeGrid(project.grid);
@@ -222,7 +223,7 @@ export default function Home() {
     const timer = window.setTimeout(() => {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
         version: 2,
-        name: fileName || "豆搭工程",
+        name: fileName || "拼豆工程",
         savedAt: new Date().toISOString(),
         settings,
         transform,
@@ -495,7 +496,7 @@ export default function Home() {
       setFileName(typeof project.name === "string" ? project.name : file.name);
       setRestoreNote("工程已导入；可继续编辑、施工与导出。");
     } catch {
-      window.alert("工程文件无法读取，请确认它由豆搭导出且内容完整。");
+      window.alert("工程文件无法读取，请确认它由拼豆导出且内容完整。");
     }
   };
 
@@ -527,7 +528,7 @@ export default function Home() {
       setFileName(file.name);
       setRestoreNote("矩阵 CSV 已导入。");
     } catch {
-      window.alert("矩阵 CSV 无法读取，请使用豆搭导出的矩阵 CSV。");
+      window.alert("矩阵 CSV 无法读取，请使用拼豆导出的矩阵 CSV。");
     }
   };
 
@@ -587,9 +588,9 @@ export default function Home() {
   return (
     <main className={"app-shell" + (focusMode ? " is-focus" : "")}>
       <header className="topbar">
-        <button className="brand-mark" type="button" aria-label="豆搭首页" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}>
+        <button className="brand-mark" type="button" aria-label="拼豆首页" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}>
           <span className="brand-beads" aria-hidden="true"><i /><i /><i /><i /></span>
-          <span><b>豆搭</b><small>PERLER STUDIO</small></span>
+          <span><b>拼豆</b><small>PERLER STUDIO</small></span>
         </button>
         <div className="top-actions">
           <span className="privacy-note"><i />图片只在本机处理</span>
@@ -606,7 +607,7 @@ export default function Home() {
           <div className="hero-copy">
             <span className="eyebrow"><i />从照片到可施工图纸</span>
             <h1>把你想留住的<br />变成一颗颗<em>拼豆</em></h1>
-            <p>上传照片，豆搭会在浏览器里完成取色、去背景与色号匹配。你可以逐格修正、按库存限色、保存工程，再导出带坐标和分板线的制作图。</p>
+            <p>上传照片，拼豆会在浏览器里完成取色、去背景与色号匹配。你可以逐格修正、按库存限色、保存工程，再导出带坐标和分板线的制作图。</p>
             <div className="feature-line"><span>291 色 · 5 品牌</span><span>透明 PNG 友好</span><span>工程自动恢复</span><span>本地处理</span></div>
           </div>
           <div className="upload-stage">

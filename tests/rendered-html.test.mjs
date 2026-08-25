@@ -20,7 +20,7 @@ test("server-renders the finished product page", async () => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /<title>豆搭 · 照片转拼豆图纸<\/title>/i);
+  assert.match(html, /<title>拼豆<\/title>/i);
   assert.match(html, /把你想留住的/);
   assert.match(html, /上传一张照片/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
@@ -32,8 +32,9 @@ test("removes all disposable starter surfaces", async () => {
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
-  assert.match(page, /豆搭/);
-  assert.match(layout, /照片转拼豆图纸/);
+  assert.match(page, /拼豆/);
+  assert.match(layout, /const title = "拼豆"/);
+  assert.match(layout, /拼豆制作图纸/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton|site-creator-vinext-starter/);
   await assert.rejects(access(new URL("app/_sites-preview", root)));
 });
