@@ -53,3 +53,7 @@ npm test 会执行生产构建、服务端渲染检查、完整色表检查以�
 功能研究参考了 [liangdabiao/perler-beads-ai](https://github.com/liangdabiao/perler-beads-ai)。五品牌色号对照数据基于该项目 Apache 2.0 许可下的 colorSystemMapping.json，界面、产品结构、图像处理引擎、编辑器和导出实现均为本项目独立实现。
 
 完整归属与许可证见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) 与 [LICENSES/Apache-2.0-perler-beads-ai.txt](./LICENSES/Apache-2.0-perler-beads-ai.txt)。
+
+## 开源许可
+
+本项目原创代码采用 [Apache License 2.0](./LICENSE) 开源。第三方色号数据继续遵循其原始 Apache 2.0 许可与归属说明。
